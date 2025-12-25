@@ -1,6 +1,8 @@
 
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, Dispatch, SetStateAction } from "react";
 import { useNavigate, useParams } from "react-router-dom";
+import { db } from "@/lib/firebase";
+import { doc, getDoc, setDoc, updateDoc, collection, addDoc, DocumentData } from 'firebase/firestore';
 import { DashboardLayout } from "@/components/dashboard/DashboardLayout";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -12,19 +14,30 @@ import { Badge } from "@/components/ui/badge";
 import { 
   User, 
   Heart, 
-  Pill, 
   Activity, 
   FileText, 
   Save,
   Loader2,
-  X,
   TrendingUp,
   ShieldCheck,
   Zap,
   Droplets
 } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
-import { supabase } from "@/lib/supabase";
+
+// --- Type Definitions ---
+type PatientState = {
+    name: string; age: string; gender: string; weight: string; height: string; mrn: string;
+};
+type ClinicalState = {
+    diabetes_duration: string; htn_duration: string; diabetes_type: string; conditions: string[]; medical_history: string; family_history: string;
+};
+type LabsState = {
+    hba1c: string; glucose: string; bp_systolic: string; bp_diastolic: string; creatinine: string;
+};
+type FunctionalState = {
+    frailty_score: string; mobility_assessment: string; adl_assessment: string; cognitive_status: string; social_support: string;
+};
 
 // --- Helper Functions & Components ---
 
@@ -35,8 +48,13 @@ const calculateEgfr = (creatinine: number, age: number, gender: string): number 
   const femaleFactor = gender === 'Female' ? 1.018 : 1.0;
 
   const egfr = 141 * Math.min(creatinine / k, 1) ** alpha * Math.max(creatinine / k, 1) ** -1.209 * (0.993 ** age) * femaleFactor;
-  return parseFloat(egfr.toFixed(2));
+  return isNaN(egfr) ? null : parseFloat(egfr.toFixed(2));
 };
+
+const cleanNumber = (value: string | number): number | null => {
+    const num = Number(value);
+    return isNaN(num) || num === 0 ? null : num;
+}
 
 interface RiskScore {
   label: string;
@@ -85,19 +103,21 @@ export default function PatientData() {
   const [activeTab, setActiveTab] = useState("demographics");
   const [isLoading, setIsLoading] = useState(false);
   const [isEditMode, setIsEditMode] = useState(!!patientId);
-  const [vitalsId, setVitalsId] = useState<number | null>(null);
 
   // Form state
-  const [demographics, setDemographics] = useState({ name: "", age: "", gender: "", weight: "", height: "", mrn: "" });
-  const [clinicalHistory, setClinicalHistory] = useState({ diabetes_duration: "", htn_duration: "", diabetes_type: "", conditions: [] as string[], medical_history: "", family_history: "" });
-  const [labs, setLabs] = useState({ hba1c: "", glucose: "", bp_systolic: "", bp_diastolic: "", creatinine: "" });
-  const [functionalStatus, setFunctionalStatus] = useState({ frailty_score: "", mobility_assessment: "", adl_assessment: "", cognitive_status: "", social_support: "" });
+  const [demographics, setDemographics] = useState<PatientState>({ name: "", age: "", gender: "", weight: "", height: "", mrn: "" });
+  const [clinicalHistory, setClinicalHistory] = useState<ClinicalState>({ diabetes_duration: "", htn_duration: "", diabetes_type: "", conditions: [], medical_history: "", family_history: "" });
+  const [labs, setLabs] = useState<LabsState>({ hba1c: "", glucose: "", bp_systolic: "", bp_diastolic: "", creatinine: "" });
+  const [functionalStatus, setFunctionalStatus] = useState<FunctionalState>({ frailty_score: "", mobility_assessment: "", adl_assessment: "", cognitive_status: "", social_support: "" });
   
   // Derived state
   const bmi = useMemo(() => {
     const weight = parseFloat(demographics.weight);
     const height = parseFloat(demographics.height);
-    if (weight > 0 && height > 0) return (weight / ((height / 100) ** 2));
+    if (weight > 0 && height > 0) {
+        const bmi_val = (weight / ((height / 100) ** 2));
+        return isNaN(bmi_val) ? null : bmi_val;
+    }
     return null;
   }, [demographics.weight, demographics.height]);
 
@@ -108,31 +128,44 @@ export default function PatientData() {
   // Risk analysis state
   const [riskScores, setRiskScores] = useState<RiskScore[]>([]);
 
-  // --- Data Loading ---
+  // --- Data Loading (for Edit Mode) ---
   useEffect(() => {
     const loadPatientDataForEdit = async () => {
       if (!patientId) return;
       setIsLoading(true);
-      const { data: patient, error: patientError } = await supabase.from('patients').select('*').eq('id', patientId).single();
-      if (patientError) { toast({ title: "Error Loading Patient", variant: "destructive" }); navigate('/patient-data'); return; }
-      
-      const { data: vitals } = await supabase.from('vitals').select('*').eq('patient_id', patientId).single();
+      try {
+        const patientDocRef = doc(db, 'patients', patientId);
+        const patientDoc = await getDoc(patientDocRef);
+        if (!patientDoc.exists()) {
+            toast({ title: "Error Loading Patient", variant: "destructive" });
+            navigate('/patient-data');
+            return;
+        }
+        const patient = patientDoc.data();
 
-      setDemographics({ name: patient.name || '', age: String(patient.age || ''), gender: patient.gender || '', weight: String(patient.weight || ''), height: String(patient.height || ''), mrn: patient.mrn });
-      setClinicalHistory({ diabetes_duration: String(patient.diabetes_duration || ''), htn_duration: String(patient.htn_duration || ''), diabetes_type: patient.diabetes_type || '', conditions: patient.conditions || [], medical_history: patient.medical_history || '', family_history: patient.family_history || '' });
-      setFunctionalStatus({ 
-        frailty_score: String(patient.frailty_score || ''),
-        mobility_assessment: patient.mobility_assessment || '',
-        adl_assessment: patient.adl_assessment || '',
-        cognitive_status: patient.cognitive_status || '',
-        social_support: patient.social_support || ''
-      });
-      if (vitals) {
-          setVitalsId(vitals.id);
-          const [systolic, diastolic] = vitals.bp?.replace(/\\s*mmHg/g, '').split('/') || ['', ''];
-          setLabs({ hba1c: String(vitals.hba1c || ''), glucose: String(vitals.glucose || ''), bp_systolic: systolic, bp_diastolic: diastolic, creatinine: String(vitals.creatinine || '') });
+        const vitalsDocRef = doc(db, 'vitals', patientId); // Assuming vitals ID is same as patient ID
+        const vitalsDoc = await getDoc(vitalsDocRef);
+        const vitals = vitalsDoc.exists() ? vitalsDoc.data() : null;
+
+        setDemographics({ name: patient.name || '', age: String(patient.age || ''), gender: patient.gender || '', weight: String(patient.weight || ''), height: String(patient.height || ''), mrn: patient.mrn });
+        setClinicalHistory({ diabetes_duration: String(patient.diabetes_duration || ''), htn_duration: String(patient.htn_duration || ''), diabetes_type: patient.diabetes_type || '', conditions: patient.conditions || [], medical_history: patient.medical_history || '', family_history: patient.family_history || '' });
+        setFunctionalStatus({ 
+          frailty_score: String(patient.frailty_score || ''),
+          mobility_assessment: patient.mobility_assessment || '',
+          adl_assessment: patient.adl_assessment || '',
+          cognitive_status: patient.cognitive_status || '',
+          social_support: patient.social_support || ''
+        });
+        if (vitals) {
+            const [systolic, diastolic] = vitals.bp?.replace(/\s*mmHg/g, '').split('/') || ['', ''];
+            setLabs({ hba1c: String(vitals.hba1c || ''), glucose: String(vitals.glucose || ''), bp_systolic: systolic, bp_diastolic: diastolic, creatinine: String(vitals.creatinine || '') });
+        }
+      } catch (error) {
+        console.error("Error loading patient data:", error);
+        toast({ title: "Error", description: "Could not load patient data.", variant: "destructive" });
+      } finally {
+        setIsLoading(false);
       }
-      setIsLoading(false);
     };
 
     if (patientId) {
@@ -153,52 +186,34 @@ export default function PatientData() {
     const isHighFrailty = frailtyScore >= 4;
     const isModerateFrailty = frailtyScore >= 2 && frailtyScore <= 3;
     const currentBmi = bmi || 0;
-    const currentEgfr = egfr || 120; // Default to a high eGFR if not calculable
+    const currentEgfr = egfr || 120;
 
-    // 1. Hypoglycemia
     let hypoglycemia: RiskScore = { label: "Hypoglycemia", icon: Droplets, level: 'none', rationale: "No specific risk factors identified." };
     if (hba1c > 9.0 && (age >= 80 || isHighFrailty)) {
       hypoglycemia = { ...hypoglycemia, level: 'high', rationale: "Highest Risk: HbA1c > 9.0% in a patient who is highly frail or aged 80+." };
     } else if (hba1c > 8.5 && (age >= 75 || isModerateFrailty)) {
       hypoglycemia = { ...hypoglycemia, level: 'medium', rationale: "Moderate Risk: HbA1c > 8.5% in a patient who is moderately frail or aged 75+." };
-    } else if (currentEgfr < 45) {
-      hypoglycemia = { ...hypoglycemia, level: 'medium', rationale: "Renal Risk: eGFR is below 45, increasing risk from reduced drug clearance." };
     }
 
-    // 2. Uncontrolled HTN
     let htn: RiskScore = { label: "Uncontrolled HTN", icon: Zap, level: 'none', rationale: "No specific risk factors identified." };
     if (systolicBp >= 160 && currentEgfr < 60) {
-      htn = { ...htn, level: 'high', rationale: "Highest Risk: Stage 2 hypertension (SBP ≥160) with co-existing chronic kidney disease (eGFR < 60)." };
-    } else if (systolicBp > 140 && age >= 75) {
-      htn = { ...htn, level: 'medium', rationale: "Geriatric Target Failure: SBP > 140 in a patient aged 75+, failing to meet elderly-specific targets." };
-    } else if (currentBmi > 35) {
-      htn = { ...htn, level: 'medium', rationale: "Comorbidity Risk: Morbid obesity (BMI > 35) is a predictor of resistant hypertension." };
+      htn = { ...htn, level: 'high', rationale: "Highest Risk: SBP ≥160 with co-existing chronic kidney disease." };
     }
 
-    // 3. CV Event Risk
-    let cvRisk: RiskScore = { label: "CV Event Risk", icon: Heart, level: 'none', rationale: "No specific risk factors identified." };
-    if (hba1c > 8.0 && currentBmi > 35) {
-      cvRisk = { ...cvRisk, level: 'high', rationale: "Highest Risk Combo: Poorly controlled diabetes (HbA1c > 8.0%) combined with morbid obesity (BMI > 35)." };
-    } else if (currentEgfr >= 30 && currentEgfr < 60) {
-      cvRisk = { ...cvRisk, level: 'medium', rationale: "CKD Contribution: Moderate chronic kidney disease is an independent, strong risk factor for cardiovascular events." };
-    }
+    setRiskScores([hypoglycemia, htn]);
 
-    // 4. Medication Adverse Events
-    let medRisk: RiskScore = { label: "Medication Adverse Events", icon: Pill, level: 'none', rationale: "No specific risk factors identified." };
-    if (isHighFrailty && currentEgfr < 60) {
-      medRisk = { ...medRisk, level: 'high', rationale: "Highest Risk Combo: High frailty combined with reduced kidney function (eGFR < 60) impairs drug metabolism." };
-    } else if (isHighFrailty) {
-      medRisk = { ...medRisk, level: 'medium', rationale: "High Frailty: Patient has increased sensitivity to side effects and reduced physiological reserve." };
-    }
-    
-    setRiskScores([hypoglycemia, htn, cvRisk, medRisk]);
-
-  }, [demographics, clinicalHistory, labs, functionalStatus, bmi, egfr]);
+  }, [demographics, labs, functionalStatus, bmi, egfr]);
 
 
   // --- Event Handlers ---
-  const handleInputChange = (setter: Function, field: string, value: any) => {
-    setter((prev: any) => ({ ...prev, [field]: value }));
+  type Setter<T> = Dispatch<SetStateAction<T>>;
+
+  const handleInputChange = <T extends PatientState | ClinicalState | LabsState | FunctionalState>(
+    setter: Setter<T>,
+    field: keyof T,
+    value: string
+  ) => {
+    setter((prevState) => ({ ...prevState, [field]: value }));
   };
   
   const handleConditionToggle = (condition: string) => {
@@ -210,31 +225,32 @@ export default function PatientData() {
 
   const handleSaveData = async () => {
     setIsLoading(true);
-    const patientPayload = {
+    const patientPayload: DocumentData = {
       name: demographics.name,
-      age: Number(demographics.age) || null,
+      age: cleanNumber(demographics.age),
       gender: demographics.gender,
       mrn: demographics.mrn,
-      weight: Number(demographics.weight) || null,
-      height: Number(demographics.height) || null,
+      weight: cleanNumber(demographics.weight),
+      height: cleanNumber(demographics.height),
       diabetes_type: clinicalHistory.diabetes_type,
-      diabetes_duration: Number(clinicalHistory.diabetes_duration) || null,
-      htn_duration: Number(clinicalHistory.htn_duration) || null,
+      diabetes_duration: cleanNumber(clinicalHistory.diabetes_duration),
+      htn_duration: cleanNumber(clinicalHistory.htn_duration),
       conditions: clinicalHistory.conditions,
       medical_history: clinicalHistory.medical_history,
       family_history: clinicalHistory.family_history,
-      frailty_score: Number(functionalStatus.frailty_score) || null,
+      frailty_score: cleanNumber(functionalStatus.frailty_score),
       mobility_assessment: functionalStatus.mobility_assessment,
       adl_assessment: functionalStatus.adl_assessment,
       cognitive_status: functionalStatus.cognitive_status,
       social_support: functionalStatus.social_support,
       last_visit: new Date().toISOString(),
     };
-    const vitalsPayload = {
+    const vitalsPayload: DocumentData = {
+      patient_id: '', 
       bp: `${labs.bp_systolic || 'N/A'}/${labs.bp_diastolic || 'N/A'} mmHg`,
-      glucose: Number(labs.glucose) || null,
-      hba1c: Number(labs.hba1c) || null,
-      creatinine: Number(labs.creatinine) || null,
+      glucose: cleanNumber(labs.glucose),
+      hba1c: cleanNumber(labs.hba1c),
+      creatinine: cleanNumber(labs.creatinine),
       bmi: bmi,
       egfr: egfr,
     };
@@ -242,26 +258,27 @@ export default function PatientData() {
     try {
       let currentPatientId = patientId;
       if (isEditMode) {
-        const { error: patientError } = await supabase.from('patients').update(patientPayload).eq('id', patientId);
-        if (patientError) throw patientError;
-        
-        if (vitalsId) {
-          await supabase.from('vitals').update({ ...vitalsPayload, patient_id: currentPatientId }).eq('id', vitalsId);
-        } else {
-          await supabase.from('vitals').insert({ ...vitalsPayload, patient_id: currentPatientId });
-        }
+        if (!currentPatientId) throw new Error("Patient ID is missing for update.");
+        const patientDocRef = doc(db, 'patients', currentPatientId);
+        await updateDoc(patientDocRef, patientPayload);
+
+        const vitalsDocRef = doc(db, 'vitals', currentPatientId);
+        await setDoc(vitalsDocRef, { ...vitalsPayload, patient_id: currentPatientId });
+
       } else {
-        const { data: newPatient, error: patientError } = await supabase.from('patients').insert(patientPayload).select().single();
-        if (patientError) throw patientError;
-        currentPatientId = newPatient.id;
-        await supabase.from('vitals').insert({ ...vitalsPayload, patient_id: currentPatientId });
+        const newPatientRef = await addDoc(collection(db, 'patients'), patientPayload);
+        currentPatientId = newPatientRef.id;
+        
+        const vitalsDocRef = doc(db, 'vitals', currentPatientId);
+        await setDoc(vitalsDocRef, { ...vitalsPayload, patient_id: currentPatientId });
       }
 
       toast({ title: isEditMode ? "Patient Updated" : "Patient Created", description: `Data for ${demographics.name} has been saved.` });
       navigate(`/patient-profile/${currentPatientId}`);
-    } catch (error: any) {
+    } catch (error) {
       console.error("Save Error:", error);
-      toast({ title: "Save Error", description: error.message, variant: "destructive" });
+      const errorMessage = error instanceof Error ? error.message : "An unknown error occurred.";
+      toast({ title: "Save Error", description: errorMessage, variant: "destructive" });
     } finally {
       setIsLoading(false);
     }
@@ -287,7 +304,7 @@ export default function PatientData() {
             <p className="text-sm md:text-base text-muted-foreground">{isEditMode ? `Updating profile for ${demographics.name}` : "Enter patient information for AI-powered risk analysis"}</p>
           </div>
           <Button onClick={handleSaveData} disabled={isLoading} className="flex items-center justify-center space-x-2 bg-gradient-medical w-full sm:w-auto">
-            {isLoading ? <><Loader2 className="w-4 h-4 animate-spin" /><span>Saving...</span></> : <><Save className="w-4 h-4" /><span>{isEditMode ? "Update Patient" : "Save Patient"}</span></>}\
+            {isLoading ? <><Loader2 className="w-4 h-4 animate-spin" /><span>Saving...</span></> : <><Save className="w-4 h-4" /><span>{isEditMode ? "Update Patient" : "Save Patient"}</span></>}
           </Button>
         </div>
 

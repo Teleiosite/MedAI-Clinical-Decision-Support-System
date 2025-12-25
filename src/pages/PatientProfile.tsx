@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
-import { supabase } from "@/lib/supabase";
+import { db } from "@/lib/firebase"; // SWITCHED TO FIREBASE
+import { collection, doc, getDoc, getDocs, deleteDoc, query, where } from 'firebase/firestore'; // Firebase methods
 import { DashboardLayout } from "@/components/dashboard/DashboardLayout";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
@@ -32,11 +33,11 @@ import {
   Brain
 } from "lucide-react";
 
-// Data structure interfaces
+// --- TypeScript Interfaces (Updated for Firebase) ---
 interface Medication { name: string; dosage: string; frequency: string; }
 interface Appointment { date: string; time: string; type: string; clinician: string; }
-interface Patient { id: number; name: string; age: number; gender: string; mrn: string; last_visit: string; primary_care: string; conditions: string[]; weight: number | null; height: number | null; diabetes_duration: number | null; diabetes_type: string | null; medical_history: string | null; family_history: string | null; frailty_score: number | null; mobility_assessment: string | null; adl_assessment: string | null; cognitive_status: string | null; social_support: string | null; vitals: any; medications: Medication[]; appointments: Appointment[]; }
-interface PatientListItem { id: number; name: string; }
+interface Patient { id: string; name: string; age: number; gender: string; mrn: string; last_visit: string; primary_care: string; conditions: string[]; weight: number | null; height: number | null; diabetes_duration: number | null; diabetes_type: string | null; medical_history: string | null; family_history: string | null; frailty_score: number | null; mobility_assessment: string | null; adl_assessment: string | null; cognitive_status: string | null; social_support: string | null; vitals: any; medications: Medication[]; appointments: Appointment[]; }
+interface PatientListItem { id: string; name: string; }
 
 export default function PatientProfile() {
   const { patientId } = useParams();
@@ -54,51 +55,56 @@ export default function PatientProfile() {
       setLoading(true);
       setError(null);
 
-      // Step 1: Fetch the list of patients. This is always needed.
-      const { data: patientList, error: listError } = await supabase
-        .from('patients')
-        .select('id, name')
-        .order('name');
+      try {
+        // Step 1: Fetch the list of all patients for the dropdown.
+        const patientsCollection = collection(db, 'patients');
+        const patientListSnapshot = await getDocs(patientsCollection);
+        const patientList = patientListSnapshot.docs.map(doc => ({ id: doc.id, name: doc.data().name as string }));
+        setPatients(patientList.sort((a,b) => a.name.localeCompare(b.name)));
 
-      if (listError) {
-        setError("Error: Could not load the list of patients.");
-        setPatients([]); // On error, ensure the list is empty
-        setLoading(false);
-        return;
-      }
+        // Step 2: If a patientId is in the URL, fetch their full profile.
+        if (patientId) {
+          const patientDocRef = doc(db, 'patients', patientId);
+          const patientDoc = await getDoc(patientDocRef);
 
-      setPatients(patientList || []);
+          if (!patientDoc.exists()) {
+            setError(`Error: Patient with ID ${patientId} not found.`);
+            setPatient(null);
+            toast({ title: "Patient Not Found", variant: "destructive" });
+          } else {
+            const patientData = patientDoc.data();
+            
+            const vitalsDocRef = doc(db, 'vitals', patientId); // Assumes vitals ID = patient ID
+            const vitalsDoc = await getDoc(vitalsDocRef);
+            const vitalsData = vitalsDoc.exists() ? vitalsDoc.data() : {};
 
-      // Step 2: If a patientId is in the URL, fetch their full profile.
-      const targetId = patientId;
-      if (targetId) {
-        const { data: patientData, error: patientError } = await supabase.from('patients').select('*').eq('id', targetId).single();
-        
-        if (patientError) {
-          setError(`Error: Patient with ID ${targetId} not found.`);
-          setPatient(null);
+            const medsQuery = query(collection(db, "medications"), where("patient_id", "==", patientId));
+            const medsSnapshot = await getDocs(medsQuery);
+            const medicationsData = medsSnapshot.docs.map(d => d.data()) as Medication[];
+            
+            setPatient({ 
+              id: patientDoc.id, 
+              ...(patientData as Omit<Patient, 'id' | 'vitals' | 'medications' | 'appointments'>),
+              vitals: vitalsData,
+              medications: medicationsData,
+              appointments: [] // Placeholder for appointments
+            });
+          }
         } else {
-          const { data: vitalsData } = await supabase.from('vitals').select('*').eq('patient_id', targetId).single();
-          const { data: medicationsData } = await supabase.from('medications').select('*').eq('patient_id', targetId);
-
-          setPatient({ 
-            ...patientData, 
-            vitals: vitalsData || {}, 
-            medications: medicationsData || [], 
-            appointments: [] // Appointments not implemented yet
-          });
+          setPatient(null); // Clear patient if no ID in URL
         }
-      } else {
-        // If no ID is in the URL, we clear any previously loaded patient.
-        setPatient(null);
-      }
 
-      // Step 3: All data fetching is complete. Stop loading.
-      setLoading(false);
+      } catch (e) {
+          console.error("Error initializing page: ", e);
+          setError("Error: Could not load required data from the database.");
+          toast({ title: "Database Error", variant: "destructive" });
+      } finally {
+        setLoading(false);
+      }
     };
 
     initializePage();
-  }, [patientId]); // This effect re-runs only when the patientId (from URL) changes.
+  }, [patientId, toast]); // Re-run when patientId changes
 
 
   const handlePatientChange = (id: string) => {
@@ -109,13 +115,15 @@ export default function PatientProfile() {
 
   const handleDeletePatient = async () => {
     if (!patient) return;
-    const { error } = await supabase.from('patients').delete().eq('id', patient.id);
+    try {
+      await deleteDoc(doc(db, 'patients', patient.id));
+      await deleteDoc(doc(db, 'vitals', patient.id)); // Also delete associated vitals
 
-    if (error) {
-      toast({ title: "Error Deleting Patient", description: error.message, variant: "destructive" });
-    } else {
       toast({ title: "Patient Deleted", description: `${patient.name} has been removed.` });
       navigate('/patient-profile', { replace: true });
+    } catch (error) {
+      console.error("Delete Error:", error);
+      toast({ title: "Error Deleting Patient", description: "Could not remove patient data.", variant: "destructive" });
     }
     setIsDeleteDialogOpen(false);
   };
@@ -154,18 +162,15 @@ export default function PatientProfile() {
     return <DashboardLayout><div className="flex items-center justify-center h-full"><Loader2 className="w-8 h-8 animate-spin text-primary" /><p className="text-xl ml-4">Loading Patient Data...</p></div></DashboardLayout>;
   }
 
-  // This is the main display logic for when a specific patient is NOT loaded.
   if (!patient) {
-    // Case 1: The patient list has loaded and contains patients.
     if (patients && patients.length > 0) {
         return <DashboardLayout><div className="flex flex-col gap-4 items-center justify-center h-full">
             <h2 className="text-2xl font-bold">Select a Patient</h2>
-            <p className="text-sm text-center text-muted-foreground max-w-md">To get started,  load the first patient's profile and then choose the patient of your choice from the from the dropdown.</p>
+            <p className="text-sm text-center text-muted-foreground max-w-md">To get started, load the first patient's profile and then choose the patient of your choice from the dropdown.</p>
             <Button onClick={() => navigate(`/patient-profile/${patients[0].id}`)}>Load First Patient Profile</Button>
         </div></DashboardLayout>;
     }
 
-    // Case 2: The patient list is empty, or there was an error.
     return <DashboardLayout><div className="flex flex-col gap-4 items-center justify-center h-full">
         <p className="text-xl font-semibold text-muted-foreground">No Patient Data</p>
         <p className="text-sm text-center max-w-md">{error ? error : "There are no patients in the database. Please add a new patient to begin."}</p>
@@ -175,7 +180,6 @@ export default function PatientProfile() {
 
   const bmi = patient.weight && patient.height ? (patient.weight / ((patient.height / 100) ** 2)).toFixed(2) : null;
 
-  // This renders only when a patient is fully loaded.
   return (
     <DashboardLayout>
       <AlertDialog open={isDeleteDialogOpen} onOpenChange={setIsDeleteDialogOpen}><AlertDialogContent><AlertDialogHeader><AlertDialogTitle>Are you absolutely sure?</AlertDialogTitle><AlertDialogDescription>This will permanently delete <strong>{patient.name}</strong> and all associated data.</AlertDialogDescription></AlertDialogHeader><AlertDialogFooter><AlertDialogCancel>Cancel</AlertDialogCancel><AlertDialogAction onClick={handleDeletePatient} className="bg-destructive hover:bg-destructive/90">Delete</AlertDialogAction></AlertDialogFooter></AlertDialogContent></AlertDialog>
@@ -203,7 +207,7 @@ export default function PatientProfile() {
             </div>
              <div className="text-sm text-muted-foreground text-left md:text-right">
               <p>Last Visit: {new Date(patient.last_visit).toLocaleDateString()}</p>
-              <p>Primary Care: {patient.primary_care}</p>
+              <p>Primary Care: {patient.primary_care || 'N/A'}</p>
             </div>
           </CardHeader>
            <CardContent>
@@ -215,7 +219,7 @@ export default function PatientProfile() {
         </Card>
         
         <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-6">
-            {renderInfoCard('Vitals & Labs', { 'Blood Pressure': patient.vitals?.bp, 'Heart Rate': patient.vitals?.hr, 'Temperature': patient.vitals?.temp, 'Fasting Glucose': patient.vitals?.glucose, 'HbA1c': patient.vitals?.hba1c ? `${patient.vitals.hba1c}%` : null, 'Total Cholesterol': patient.vitals?.cholesterol ? `${patient.vitals.cholesterol} mg/dL` : null, 'LDL': patient.vitals?.ldl ? `${patient.vitals.ldl} mg/dL` : null, 'HDL': patient.vitals?.hdl ? `${patient.vitals.hdl} mg/dL` : null, 'Triglycerides': patient.vitals?.triglycerides ? `${patient.vitals.triglycerides} mg/dL` : null, 'Creatinine': patient.vitals?.creatinine ? `${patient.vitals.creatinine} mg/dL` : null, }, Stethoscope)}
+            {renderInfoCard('Vitals & Labs', { 'Blood Pressure': patient.vitals?.bp, 'Heart Rate': patient.vitals?.hr, 'Temperature': patient.vitals?.temp, 'Fasting Glucose': patient.vitals?.glucose, 'HbA1c': patient.vitals?.hba1c ? `${patient.vitals.hba1c}%` : null, 'Creatinine': patient.vitals?.creatinine ? `${patient.vitals.creatinine} mg/dL` : null, 'eGFR': patient.vitals?.egfr ? `${patient.vitals.egfr} ml/min/1.73m²` : null }, Stethoscope)}
             {renderInfoCard('Clinical Stats', { 'Weight': patient.weight ? `${patient.weight} kg` : null, 'Height': patient.height ? `${patient.height} cm` : null, 'BMI': bmi, 'Diabetes Type': patient.diabetes_type, 'Diabetes Duration': patient.diabetes_duration ? `${patient.diabetes_duration} years` : null, }, HeartPulse)}
             {renderInfoCard('Functional Status', { 'Frailty Score': patient.frailty_score, 'Mobility': patient.mobility_assessment, 'Cognitive Status': patient.cognitive_status }, FileText)}
         </div>
@@ -241,19 +245,6 @@ export default function PatientProfile() {
           </CardContent>
         </Card>
 
-         <Card className="shadow-card">
-          <CardHeader><CardTitle className="flex items-center"><Calendar className="w-5 h-5 mr-2 text-primary" />Upcoming Appointments</CardTitle></CardHeader>
-          <CardContent>
-             <Table>
-              <TableHeader><TableRow><TableHead>Date</TableHead><TableHead>Time</TableHead><TableHead>Type</TableHead><TableHead>Clinician</TableHead></TableRow></TableHeader>
-              <TableBody>
-                {patient.appointments?.length > 0 ? patient.appointments.map((appt, i) => (
-                  <TableRow key={i}><TableCell>{new Date(appt.date).toLocaleDateString()}</TableCell><TableCell>{appt.time}</TableCell><TableCell>{appt.type}</TableCell><TableCell>{appt.clinician}</TableCell></TableRow>
-                )) : <TableRow><TableCell colSpan={4} className="text-center text-muted-foreground">No appointments scheduled.</TableCell></TableRow>}
-              </TableBody>
-            </Table>
-          </CardContent>
-        </Card>
       </div>
     </DashboardLayout>
   );
